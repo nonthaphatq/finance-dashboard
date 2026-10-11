@@ -1,0 +1,38 @@
+# ==========================================
+# SECURITY: NEVER commit these files to git
+# ==========================================
+credentials.json
+token.json
+*secret*.json
+*token*.json
+*credential*.json
+.env
+.env.*
+*.env
+
+# Database & Backups
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+finance*.db
+
+# Logs & Process locks
+logs/
+*.log
+*.lock
+
+# Python virtual environment & cache
+.venv/
+venv/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
