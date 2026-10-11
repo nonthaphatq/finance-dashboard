@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 fetch_emails.py
-Fetch KBank K PLUS transaction emails from Gmail and save to SQLite.
+Fetch KBank K PLUS transaction emails from Gmail and save to Supabase / SQLite.
 
 Usage:
     python fetch_emails.py
 
-First run: browser will open for Google OAuth login.
-Subsequent runs: uses saved token.json (auto-refreshed).
-
+Runs locally or in GitHub Actions.
 Security notes:
-- Uses gmail.readonly scope ONLY (cannot send, delete, or modify emails)
+- Uses gmail.readonly scope ONLY
+- Does not print monetary amounts, recipient names, or email bodies to logs
 - Filters by exact sender address to block phishing emails
-- credentials.json and token.json must NEVER be shared or committed to git
+- credentials and tokens loaded from environment or local files
 """
 
 import base64
@@ -23,6 +22,7 @@ from datetime import datetime, timezone, timedelta
 from email import message_from_bytes
 from pathlib import Path
 
+from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -38,6 +38,8 @@ from database import (
     update_last_synced_at,
 )
 
+load_dotenv()
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -45,6 +47,13 @@ from database import (
 BASE_DIR         = Path(__file__).parent
 CREDENTIALS_FILE = BASE_DIR / "credentials.json"
 TOKEN_FILE       = BASE_DIR / "token.json"
+
+# Support loading credentials from GitHub Secrets (environment variables)
+if os.getenv("GOOGLE_CREDENTIALS_JSON") and not CREDENTIALS_FILE.exists():
+    CREDENTIALS_FILE.write_text(os.getenv("GOOGLE_CREDENTIALS_JSON"), encoding="utf-8")
+
+if os.getenv("GOOGLE_TOKEN_JSON") and not TOKEN_FILE.exists():
+    TOKEN_FILE.write_text(os.getenv("GOOGLE_TOKEN_JSON"), encoding="utf-8")
 
 # gmail.readonly = read-only, cannot modify or send anything
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
@@ -68,7 +77,7 @@ def get_gmail_service():
     """
     if not CREDENTIALS_FILE.exists():
         print(f"ERROR: {CREDENTIALS_FILE} not found.")
-        print("Please complete Stage 3 (Google Cloud Console setup) first.")
+        print("Please configure credentials.json or GOOGLE_CREDENTIALS_JSON secret.")
         sys.exit(1)
 
     creds = None
@@ -88,16 +97,21 @@ def get_gmail_service():
                 creds = None
 
         if not creds or not creds.valid:
+            # In headless/CI environment, we cannot launch a local browser
+            if os.getenv("CI") or os.getenv("GITHUB_ACTIONS"):
+                print("ERROR: Cannot perform interactive login in CI/GitHub Actions.")
+                print("Please update the GOOGLE_TOKEN_JSON secret with a valid token.")
+                sys.exit(1)
+
             print("Opening browser for Google login...")
-            print("(Choose the Gmail account that receives KBank notifications)")
             flow = InstalledAppFlow.from_client_secrets_file(
                 str(CREDENTIALS_FILE), SCOPES
             )
             creds = flow.run_local_server(port=0)
 
         # Save token for next run
-        TOKEN_FILE.write_text(creds.to_json())
-        print(f"Token saved to: {TOKEN_FILE}")
+        TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+        print("Token refreshed and saved.")
 
     return build("gmail", "v1", credentials=creds)
 
@@ -113,7 +127,6 @@ def _make_query(since_dt: datetime | None) -> str:
     """
     sender_query = " OR ".join(f"from:{s}" for s in TARGET_SENDERS)
     if since_dt:
-        # Gmail uses Unix timestamp for 'after:'
         ts = int(since_dt.timestamp())
         date_filter = f"after:{ts}"
     else:
@@ -142,11 +155,6 @@ def _get_message_ids(service, query: str) -> list[str]:
 
 
 def _decode_payload(part) -> tuple[str, bool]:
-    """
-    Extract text from an email MIME part.
-    Returns (text, is_html).
-    Prefers plain text; falls back to HTML.
-    """
     mime_type = part.get_content_type()
     payload = part.get_payload(decode=True)
     if payload is None:
@@ -158,13 +166,7 @@ def _decode_payload(part) -> tuple[str, bool]:
 
 
 def _extract_body(raw_bytes: bytes) -> tuple[str, bool]:
-    """
-    Parse raw email bytes and extract the best text body.
-    Prefers text/plain; falls back to text/html.
-    Returns (body_text, is_html).
-    """
     msg = message_from_bytes(raw_bytes)
-
     plain_text = None
     html_text  = None
 
@@ -193,7 +195,7 @@ def fetch_and_process(service, conn) -> dict:
     """
     Main fetch loop:
     1. Query Gmail for matching emails since last sync
-    2. For each email: parse → insert into DB or log error
+    2. For each email: parse -> insert into DB or log error
     3. Update sync_state
     Returns stats dict.
     """
@@ -209,26 +211,22 @@ def fetch_and_process(service, conn) -> dict:
     for msg_id in message_ids:
         stats["processed"] += 1
         try:
-            # Fetch full raw email
             raw = service.users().messages().get(
                 userId="me", id=msg_id, format="raw"
             ).execute()
 
-            raw_bytes  = base64.urlsafe_b64decode(raw["raw"])
-            msg_obj    = message_from_bytes(raw_bytes)
-            subject    = msg_obj.get("Subject", "")
-            sender     = msg_obj.get("From", "")
+            raw_bytes   = base64.urlsafe_b64decode(raw["raw"])
+            msg_obj     = message_from_bytes(raw_bytes)
+            subject     = msg_obj.get("Subject", "")
+            sender      = msg_obj.get("From", "")
             received_at = msg_obj.get("Date", "")
 
-            # Extract just the email address from "Name <email>" format
             import re
-            addr_match = re.search(r"<(.+?)>", sender)
+            addr_match  = re.search(r"<(.+?)>", sender)
             sender_addr = addr_match.group(1) if addr_match else sender
 
-            # Extract body
             body, is_html = _extract_body(raw_bytes)
 
-            # Parse transaction data
             parsed = parse_email(
                 subject=subject,
                 body=body,
@@ -236,19 +234,18 @@ def fetch_and_process(service, conn) -> dict:
                 is_html=is_html,
             )
 
-            # Save to database
             inserted = insert_transaction(conn, parsed, email_id=msg_id)
             if inserted:
                 stats["inserted"] += 1
-                print(f"  [NEW]  {parsed['ref_no']}  {parsed['txn_at']}  "
-                      f"{parsed['amount_satang']/100:.2f} THB  ({parsed['direction']})")
+                # SECURITY: Do not print money amounts, counterparty names, or balances in logs
+                print(f"  [NEW]  ref={parsed['ref_no']}  dir={parsed['direction']}")
             else:
                 stats["duplicates"] += 1
-                print(f"  [DUP]  {parsed['ref_no']} (already in DB)")
+                print(f"  [DUP]  ref={parsed['ref_no']}")
 
         except PermissionError as e:
             stats["errors"] += 1
-            print(f"  [BLOCK] {msg_id}: {e}")
+            print(f"  [BLOCK] id={msg_id}: sender blocked")
             log_parse_error(conn, msg_id, received_at if 'received_at' in dir() else "",
                             subject if 'subject' in dir() else "", str(e))
 
@@ -256,7 +253,7 @@ def fetch_and_process(service, conn) -> dict:
             stats["errors"] += 1
             subj = subject if 'subject' in dir() else "unknown"
             recv = received_at if 'received_at' in dir() else ""
-            print(f"  [ERR]  {msg_id}: {e}")
+            print(f"  [ERR]  id={msg_id}: parse error")
             log_parse_error(conn, msg_id, recv, subj, str(e))
 
     # Update sync timestamp
@@ -275,29 +272,25 @@ def main():
     print("Finance Dashboard - Gmail Fetcher")
     print("=" * 55)
 
-    # Authenticate
     service = get_gmail_service()
     print("Gmail authentication OK")
 
-    # Connect to database
     conn = get_connection()
     print("Database connected")
 
-    # Fetch and process
     stats = fetch_and_process(service, conn)
 
-    # Summary
     print("\n" + "=" * 55)
     print("DONE")
     print(f"  Processed : {stats['processed']}")
     print(f"  Inserted  : {stats['inserted']}  (new transactions)")
     print(f"  Duplicates: {stats['duplicates']}  (skipped)")
-    print(f"  Errors    : {stats['errors']}  (saved to parse_errors table)")
+    print(f"  Errors    : {stats['errors']}")
     print("=" * 55)
 
-    conn.close()
+    if hasattr(conn, "close"):
+        conn.close()
 
 
 if __name__ == "__main__":
     main()
-

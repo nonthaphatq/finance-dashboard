@@ -1,0 +1,16 @@
+name: Keep Alive
+
+on:
+  schedule:
+    # รันทุกวันที่ 1 ของเดือน เวลาเที่ยงคืน UTC
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keep-alive ping
+        run: |
+          echo "Keep-alive ping to prevent GitHub from disabling scheduled actions after 60 days."
