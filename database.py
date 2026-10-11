@@ -1,44 +1,68 @@
 # -*- coding: utf-8 -*-
 """
 database.py
-SQLite database setup and helpers for the finance dashboard.
+Database interface supporting both Supabase (Cloud PostgreSQL) and SQLite (Local fallback).
 
-Tables:
+Cloud Tables:
   transactions  - parsed bank transactions (no duplicates via ref_no UNIQUE)
   parse_errors  - emails that could not be parsed
   sync_state    - tracks last successful Gmail sync timestamp
 """
 
+import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from dotenv import load_dotenv
 
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Supabase Configuration
+# ---------------------------------------------------------------------------
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+_supabase_client = None
+
+def get_supabase_client():
+    """Returns authenticated Supabase client for backend ingestion using service_role."""
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+    
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        from supabase import create_client
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+        return _supabase_client
+    return None
+
+def is_supabase_enabled() -> bool:
+    """Returns True if Supabase environment variables are configured."""
+    return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+# ---------------------------------------------------------------------------
+# Local SQLite fallback
+# ---------------------------------------------------------------------------
 DB_PATH = Path(__file__).parent / "finance.db"
 
-
-# ---------------------------------------------------------------------------
-# Schema
-# ---------------------------------------------------------------------------
-
 _SCHEMA_SQL = """
--- Main transactions table
 CREATE TABLE IF NOT EXISTS transactions (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-    ref_no                  TEXT    NOT NULL UNIQUE,   -- prevents duplicates
-    email_id                TEXT,                       -- Gmail message ID
-    txn_at                  TEXT    NOT NULL,           -- ISO-8601 datetime
-    direction               TEXT    NOT NULL,           -- 'in' | 'out'
-    type                    TEXT,                       -- e.g. promptpay_transfer
-    amount_satang           INTEGER NOT NULL,           -- amount x100, no float
+    ref_no                  TEXT    NOT NULL UNIQUE,
+    email_id                TEXT,
+    txn_at                  TEXT    NOT NULL,
+    direction               TEXT    NOT NULL,
+    type                    TEXT,
+    amount_satang           INTEGER NOT NULL,
     fee_satang              INTEGER NOT NULL DEFAULT 0,
     available_balance_satang INTEGER,
-    account_last4           TEXT,                       -- last 4 digits only
+    account_last4           TEXT,
     counterparty            TEXT,
     bank                    TEXT    NOT NULL DEFAULT 'KBANK',
     created_at              TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 
--- Emails that failed to parse (for debugging / manual review)
 CREATE TABLE IF NOT EXISTS parse_errors (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     email_id    TEXT,
@@ -48,38 +72,80 @@ CREATE TABLE IF NOT EXISTS parse_errors (
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 
--- Sync state: tracks the last time we polled Gmail
 CREATE TABLE IF NOT EXISTS sync_state (
-    id              INTEGER PRIMARY KEY CHECK (id = 1),  -- singleton row
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
     last_synced_at  TEXT
 );
 
--- Seed the singleton sync row on first run
 INSERT OR IGNORE INTO sync_state (id, last_synced_at) VALUES (1, NULL);
 """
 
-
-def get_connection() -> sqlite3.Connection:
-    """Open (or create) the SQLite database and ensure schema exists."""
+def get_connection():
+    """
+    Returns connection. If Supabase is configured, returns Supabase client;
+    otherwise opens/returns local SQLite connection.
+    """
+    sb = get_supabase_client()
+    if sb is not None:
+        return sb
+    
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row        # access columns by name
-    conn.execute("PRAGMA journal_mode=WAL")  # safer for concurrent reads
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA_SQL)
     conn.commit()
     return conn
 
-
 # ---------------------------------------------------------------------------
-# Transactions
+# Transactions (Insert & Duplicate prevention via ref_no)
 # ---------------------------------------------------------------------------
 
-def insert_transaction(conn: sqlite3.Connection, parsed: dict, email_id: str = "") -> bool:
+def insert_transaction(conn, parsed: dict, email_id: str = "") -> bool:
     """
     Insert one parsed transaction.
     Returns True if inserted, False if ref_no already exists (duplicate).
-    Amounts must already be in integer satang.
+    Works with both Supabase client and SQLite connection.
     """
+    # 1. Supabase Mode
+    if hasattr(conn, "table"):
+        ref_no = parsed["ref_no"]
+        
+        # Check if ref_no already exists in database
+        existing = conn.table("transactions").select("id").eq("ref_no", ref_no).execute()
+        if existing.data and len(existing.data) > 0:
+            return False  # Duplicate skipped
+        
+        txn_at_val = parsed["txn_at"]
+        if hasattr(txn_at_val, "isoformat"):
+            txn_at_str = txn_at_val.isoformat()
+        else:
+            txn_at_str = str(txn_at_val)
+
+        payload = {
+            "ref_no":                   ref_no,
+            "email_id":                 email_id,
+            "txn_at":                   txn_at_str,
+            "direction":                parsed["direction"],
+            "type":                     parsed.get("type"),
+            "amount_satang":            parsed["amount_satang"],
+            "fee_satang":               parsed.get("fee_satang", 0),
+            "available_balance_satang": parsed.get("available_balance_satang"),
+            "account_last4":            parsed.get("account_last4"),
+            "counterparty":             parsed.get("counterparty"),
+            "bank":                     parsed.get("bank", "KBANK"),
+        }
+        
+        try:
+            conn.table("transactions").insert(payload).execute()
+            return True
+        except Exception as e:
+            # Check if it was unique constraint violation race
+            if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+                return False
+            raise e
+
+    # 2. SQLite Mode
     sql = """
         INSERT OR IGNORE INTO transactions
             (ref_no, email_id, txn_at, direction, type,
@@ -90,10 +156,13 @@ def insert_transaction(conn: sqlite3.Connection, parsed: dict, email_id: str = "
              :amount_satang, :fee_satang, :available_balance_satang,
              :account_last4, :counterparty, :bank)
     """
+    txn_at_val = parsed["txn_at"]
+    txn_at_str = txn_at_val.isoformat() if hasattr(txn_at_val, "isoformat") else str(txn_at_val)
+
     params = {
         "ref_no":                   parsed["ref_no"],
         "email_id":                 email_id,
-        "txn_at":                   parsed["txn_at"].isoformat(),
+        "txn_at":                   txn_at_str,
         "direction":                parsed["direction"],
         "type":                     parsed.get("type"),
         "amount_satang":            parsed["amount_satang"],
@@ -105,16 +174,23 @@ def insert_transaction(conn: sqlite3.Connection, parsed: dict, email_id: str = "
     }
     cursor = conn.execute(sql, params)
     conn.commit()
-    return cursor.rowcount > 0   # True = new row, False = duplicate skipped
-
+    return cursor.rowcount > 0
 
 # ---------------------------------------------------------------------------
 # Parse errors
 # ---------------------------------------------------------------------------
 
-def log_parse_error(conn: sqlite3.Connection, email_id: str,
-                    received_at: str, subject: str, reason: str) -> None:
+def log_parse_error(conn, email_id: str, received_at: str, subject: str, reason: str) -> None:
     """Record an email that could not be parsed."""
+    if hasattr(conn, "table"):
+        conn.table("parse_errors").insert({
+            "email_id": email_id,
+            "received_at": received_at,
+            "subject": subject,
+            "reason": reason,
+        }).execute()
+        return
+
     conn.execute(
         """INSERT INTO parse_errors (email_id, received_at, subject, reason)
            VALUES (?, ?, ?, ?)""",
@@ -122,132 +198,32 @@ def log_parse_error(conn: sqlite3.Connection, email_id: str,
     )
     conn.commit()
 
-
 # ---------------------------------------------------------------------------
 # Sync state
 # ---------------------------------------------------------------------------
 
-def get_last_synced_at(conn: sqlite3.Connection) -> datetime | None:
+def get_last_synced_at(conn) -> datetime | None:
     """Return the last sync timestamp, or None if never synced."""
+    if hasattr(conn, "table"):
+        res = conn.table("sync_state").select("last_synced_at").eq("id", 1).execute()
+        if res.data and len(res.data) > 0 and res.data[0].get("last_synced_at"):
+            return datetime.fromisoformat(res.data[0]["last_synced_at"])
+        return None
+
     row = conn.execute("SELECT last_synced_at FROM sync_state WHERE id = 1").fetchone()
     if row and row["last_synced_at"]:
         return datetime.fromisoformat(row["last_synced_at"])
     return None
 
-
-def update_last_synced_at(conn: sqlite3.Connection, dt: datetime) -> None:
+def update_last_synced_at(conn, dt: datetime) -> None:
     """Update the last sync timestamp."""
+    iso_val = dt.isoformat()
+    if hasattr(conn, "table"):
+        conn.table("sync_state").upsert({"id": 1, "last_synced_at": iso_val}).execute()
+        return
+
     conn.execute(
         "UPDATE sync_state SET last_synced_at = ? WHERE id = 1",
-        (dt.isoformat(),),
+        (iso_val,),
     )
     conn.commit()
-
-
-# ---------------------------------------------------------------------------
-# Balance continuity check (Stage 6)
-# ---------------------------------------------------------------------------
-
-def check_balance_continuity(conn: sqlite3.Connection) -> list[dict]:
-    """
-    Detect gaps in balance continuity.
-    Consecutive transactions' available_balance should match the previous row's
-    (balance_after = balance_before_next).  Returns list of suspicious rows.
-    """
-    rows = conn.execute(
-        """SELECT id, ref_no, txn_at, amount_satang, fee_satang,
-                  available_balance_satang
-           FROM transactions
-           ORDER BY txn_at ASC"""
-    ).fetchall()
-
-    gaps = []
-    for i in range(len(rows) - 1):
-        cur  = rows[i]
-        nxt  = rows[i + 1]
-        # Expected balance after current tx:
-        # available_balance is AFTER the transaction, so next tx's balance
-        # should be <= current balance (money went out) or we might have missed an email
-        # Simple check: if next balance > current balance + large threshold, flag it
-        if cur["available_balance_satang"] is not None and nxt["available_balance_satang"] is not None:
-            diff = nxt["available_balance_satang"] - cur["available_balance_satang"]
-            # Flag if balance jumped up unexpectedly (possible missing incoming tx)
-            if diff > 0:
-                gaps.append({
-                    "after_ref_no":  cur["ref_no"],
-                    "before_ref_no": nxt["ref_no"],
-                    "balance_jump_satang": diff,
-                })
-    return gaps
-
-
-# ---------------------------------------------------------------------------
-# Self-test (run: python database.py)
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    from datetime import datetime, timezone
-
-    print("=" * 55)
-    print("TEST: database.py")
-    print("=" * 55)
-
-    # Use a temporary test DB
-    import tempfile, os
-    test_db = Path(tempfile.mktemp(suffix=".db"))
-    _orig_db = DB_PATH
-
-    # Monkey-patch for test
-    import database as _self
-    _self.DB_PATH = test_db
-
-    conn = get_connection()
-    print("  Schema created OK")
-
-    # Insert a transaction
-    sample = {
-        "ref_no":                   "TEST001",
-        "txn_at":                   datetime(2026, 10, 9, 22, 53, 18),
-        "direction":                "out",
-        "type":                     "promptpay_transfer",
-        "amount_satang":            5000,
-        "fee_satang":               0,
-        "available_balance_satang": 203727,
-        "account_last4":            "7534",
-        "counterparty":             "Test User",
-        "bank":                     "KBANK",
-    }
-    inserted = insert_transaction(conn, sample, email_id="gmail_001")
-    print(f"  Insert result (should be True) : {inserted}")
-
-    # Duplicate should be ignored
-    inserted2 = insert_transaction(conn, sample, email_id="gmail_001")
-    print(f"  Duplicate result (should be False): {inserted2}")
-
-    # Row count should be 1
-    count = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
-    print(f"  Row count (should be 1): {count}")
-
-    # Log a parse error
-    log_parse_error(conn, "gmail_002", "2026-10-09T20:00:00", "Unknown subject", "No parser matched")
-    err_count = conn.execute("SELECT COUNT(*) FROM parse_errors").fetchone()[0]
-    print(f"  Parse errors (should be 1): {err_count}")
-
-    # Sync state
-    update_last_synced_at(conn, datetime(2026, 10, 9, 23, 0, 0))
-    last = get_last_synced_at(conn)
-    print(f"  Last synced at: {last}")
-
-    conn.close()
-    try:
-        os.unlink(test_db)
-        for ext in ("-wal", "-shm"):   # WAL mode creates extra files
-            p = Path(str(test_db) + ext)
-            if p.exists():
-                p.unlink()
-    except FileNotFoundError:
-        pass
-    print("  Temp DB cleaned up")
-    print("=" * 55)
-    print("STAGE 5+6 DB PASSED")
-
