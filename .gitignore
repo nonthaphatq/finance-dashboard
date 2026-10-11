@@ -32,6 +32,14 @@ __pycache__/
 *.pyd
 *.egg-info/
 
+# Next.js, Node & Vercel
+node_modules/
+.next/
+out/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+
 # OS files
 .DS_Store
 Thumbs.db

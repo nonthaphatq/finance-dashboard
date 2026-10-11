@@ -45,3 +45,4 @@ jobs:
         if: failure()
         run: |
           echo "::error title=Fetch Emails Failed::Workflow fetch_emails failed! Please check Gmail token expiration or Supabase connection."
+
