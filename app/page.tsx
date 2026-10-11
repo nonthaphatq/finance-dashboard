@@ -93,23 +93,23 @@ export default function DashboardPage() {
     try {
       // Fetch transactions
       const { data: txData, error: txErr } = await supabase
-        .table('transactions')
+        .from('transactions')
         .select('*')
         .order('txn_at', { ascending: false })
 
       if (txErr) console.error('Error fetching transactions:', txErr)
-      else setTransactions(txData || [])
+      else setTransactions((txData as any) || [])
 
       // Fetch parse errors count
       const { count: errCount, error: errErr } = await supabase
-        .table('parse_errors')
+        .from('parse_errors')
         .select('*', { count: 'exact', head: true })
 
       if (!errErr) setParseErrorCount(errCount || 0)
 
       // Fetch sync state
       const { data: syncData, error: syncErr } = await supabase
-        .table('sync_state')
+        .from('sync_state')
         .select('last_synced_at')
         .eq('id', 1)
         .single()
@@ -608,3 +608,4 @@ export default function DashboardPage() {
     </div>
   )
 }
+
