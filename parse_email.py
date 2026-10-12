@@ -64,7 +64,7 @@ def _parse_txn_datetime(value_str: str) -> datetime:
     Parse date/time string e.g. '09/10/2026 22:53:18' -> datetime.
     Supports both CE and BE years (year > 2400 -> subtract 543).
     """
-    value_str = value_str.strip()
+    value_str = re.sub(r"\s+", " ", value_str.strip())
     dt = datetime.strptime(value_str, "%d/%m/%Y %H:%M:%S")
     if dt.year > 2400:
         dt = dt.replace(year=dt.year - 543)
@@ -90,13 +90,13 @@ def _parse_transfer_out_promptpay(text: str) -> dict:
     """
     txn_at_str  = _find_field(r"วันที่ทำรายการ[:\s]+([0-9/: ]+)", text, "txn_date")
     ref_no      = _find_field(r"เลขที่รายการ[:\s]+(\S+)", text, "ref_no")
-    account_raw = _find_field(r"โอนเงินจากบัญชี[:\s]+(\S+)", text, "account")
+    account_raw = _find_field(r"(?:โอนเงินจากบัญชี|ชำระเงินจากบัญชี)[:\s]+(\S+)", text, "account")
     amount_str  = _find_field(r"จำนวนเงิน\s*\(บาท\)[:\s]+([\d,]+\.\d+)", text, "amount")
     fee_str     = _find_field(r"ค่าธรรมเนียม\s*\(บาท\)[:\s]+([\d,]+\.\d+)", text, "fee")
     balance_str = _find_field(r"ยอดถอนได้\s*\(บาท\)[:\s]+([\d,]+\.\d+)", text, "balance")
 
     # counterparty is optional
-    cp_match = re.search(r"ชื่อผู้รับเงิน[:\s]+(.+)", text, re.UNICODE)
+    cp_match = re.search(r"(?:ชื่อผู้รับเงิน|ชื่อบัญชี)[:\s]+(.+)", text, re.UNICODE)
     counterparty = cp_match.group(1).strip() if cp_match else None
 
     # Keep only last 4 digits of account number (security: no full account)
@@ -128,7 +128,7 @@ def _parse_transfer_out_bank(text: str) -> dict:
     # Use Thai labels (appear first in the bilingual email)
     txn_at_str  = _find_field(r"วันที่ทำรายการ[:\s]+([0-9/: ]+)", text, "txn_date")
     ref_no      = _find_field(r"เลขที่รายการ[:\s]+(\S+)", text, "ref_no")
-    account_raw = _find_field(r"โอนเงินจากบัญชี[:\s]+(\S+)", text, "account")
+    account_raw = _find_field(r"(?:โอนเงินจากบัญชี|ชำระเงินจากบัญชี)[:\s]+(\S+)", text, "account")
     amount_str  = _find_field(r"จำนวนเงิน\s*\(บาท\)[:\s]+([\d,]+\.\d+)", text, "amount")
     fee_str     = _find_field(r"ค่าธรรมเนียม\s*\(บาท\)[:\s]+([\d,]+\.\d+)", text, "fee")
     balance_str = _find_field(r"ยอดถอนได้\s*\(บาท\)[:\s]+([\d,]+\.\d+)", text, "balance")
@@ -159,6 +159,44 @@ def _parse_transfer_out_bank(text: str) -> dict:
     }
 
 
+def _parse_payment_generic(text: str, txn_type: str = "payment") -> dict:
+    """Parse QR payment or Bill payment email."""
+    txn_at_str  = _find_field(r"วันที่ทำรายการ[:\s]+([0-9/: ]+)", text, "txn_date")
+    ref_no      = _find_field(r"เลขที่รายการ[:\s]+(\S+)", text, "ref_no")
+    account_raw = _find_field(r"(?:ชำระเงินจากบัญชี|โอนเงินจากบัญชี)[:\s]+(\S+)", text, "account")
+    amount_str  = _find_field(r"จำนวนเงิน\s*\(บาท\)[:\s]+([\d,]+\.\d+)", text, "amount")
+    fee_str     = _find_field(r"ค่าธรรมเนียม\s*\(บาท\)[:\s]+([\d,]+\.\d+)", text, "fee")
+    balance_str = _find_field(r"ยอดถอนได้\s*\(บาท\)[:\s]+([\d,]+\.\d+)", text, "balance")
+
+    # Destination merchant / company / recipient
+    cp_match = re.search(r"(?:เพื่อเข้าบัญชี(?:ร้านค้า/บริษัท|บริษัท)?|ชื่อผู้รับเงิน|ชื่อบัญชี)[:\s]+(.+)", text, re.UNICODE)
+    counterparty = cp_match.group(1).strip() if cp_match else None
+
+    digits = re.findall(r"\d+", account_raw)
+    account_last4 = digits[-1][-4:] if digits else None
+
+    return {
+        "txn_at":                   _parse_txn_datetime(txn_at_str),
+        "ref_no":                   ref_no,
+        "account_last4":            account_last4,
+        "counterparty":             counterparty,
+        "amount_satang":            _parse_amount_to_satang(amount_str),
+        "fee_satang":               _parse_amount_to_satang(fee_str),
+        "available_balance_satang": _parse_amount_to_satang(balance_str),
+        "direction":                "out",
+        "type":                     txn_type,
+        "bank":                     "KBANK",
+    }
+
+
+def _parse_payment_out_qr(text: str) -> dict:
+    return _parse_payment_generic(text, txn_type="qr_payment")
+
+
+def _parse_payment_out_bill(text: str) -> dict:
+    return _parse_payment_generic(text, txn_type="bill_payment")
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -166,9 +204,15 @@ def _parse_transfer_out_bank(text: str) -> dict:
 # Map subject keywords to parser functions
 # Order matters: more specific keywords first
 _SUBJECT_PARSERS = {
-    "โอนเงินพร้อมเพย์":              _parse_transfer_out_promptpay,   # PromptPay (Thai subject)
-    "Result of Funds Transfer":       _parse_transfer_out_bank,         # Inter-bank (English subject)
-    "แจ้งผลการทำรายการโอนเงิน":      _parse_transfer_out_bank,         # Inter-bank (Thai subject)
+    "Result of PromptPay Funds Transfer": _parse_transfer_out_promptpay,
+    "โอนเงินพร้อมเพย์":                   _parse_transfer_out_promptpay,
+    "Result of QR Payment":               _parse_payment_out_qr,
+    "ชำระเงินด้วย QR":                     _parse_payment_out_qr,
+    "Result of Bill Payment":             _parse_payment_out_bill,
+    "ชำระค่าสินค้าและบริการ":             _parse_payment_out_bill,
+    "Result of Payment":                  _parse_payment_out_bill,
+    "Result of Funds Transfer":            _parse_transfer_out_bank,
+    "แจ้งผลการทำรายการโอนเงิน":           _parse_transfer_out_bank,
 }
 
 
